@@ -1,0 +1,73 @@
+<mujoco model="six_dof_arm_obstacle">
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.01" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint damping="1.2" armature="0.02" limited="true"/>
+    <geom condim="4" friction="0.8 0.02 0.002" rgba="0.45 0.55 0.65 1"/>
+    <motor ctrllimited="true" ctrlrange="-1 1"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.18 0.18 0.18" rgb2="0.24 0.24 0.24" width="256" height="256"/>
+    <material name="grid" texture="grid" texrepeat="4 4" reflectance="0.15"/>
+    <material name="arm" rgba="0.38 0.52 0.68 1"/>
+    <material name="joint" rgba="0.16 0.17 0.18 1"/>
+    <material name="target" rgba="0.1 0.8 0.2 0.55"/>
+    <material name="obstacle" rgba="0.9 0.18 0.12 0.85"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1"/>
+    <camera name="track" pos="1.8 -2.0 1.4" xyaxes="0.75 0.66 0 -0.32 0.36 0.88"/>
+    <geom name="floor" type="plane" size="2.2 2.2 0.01" material="grid"/>
+
+    <body name="obstacle" pos="0.50 0.00 0.55">
+      <geom name="obstacle_geom" type="sphere" size="0.12" material="obstacle"/>
+      <site name="obstacle_site" type="sphere" size="0.012" rgba="1 1 1 1"/>
+    </body>
+
+    <body name="target" pos="0.70 0.22 0.70">
+      <site name="target_site" type="sphere" size="0.045" material="target"/>
+    </body>
+
+    <body name="base" pos="0 0 0.06">
+      <geom name="base_geom" type="cylinder" size="0.11 0.06" material="joint"/>
+      <body name="link1" pos="0 0 0.08">
+        <joint name="j1" type="hinge" axis="0 0 1" range="-3.14 3.14"/>
+        <geom name="link1_geom" type="capsule" fromto="0 0 0 0 0 0.24" size="0.035" material="arm"/>
+        <body name="link2" pos="0 0 0.24">
+          <joint name="j2" type="hinge" axis="0 1 0" range="-1.8 1.8"/>
+          <geom name="link2_geom" type="capsule" fromto="0 0 0 0.26 0 0" size="0.03" material="arm"/>
+          <body name="link3" pos="0.26 0 0">
+            <joint name="j3" type="hinge" axis="0 1 0" range="-2.2 2.2"/>
+            <geom name="link3_geom" type="capsule" fromto="0 0 0 0.24 0 0" size="0.028" material="arm"/>
+            <body name="link4" pos="0.24 0 0">
+              <joint name="j4" type="hinge" axis="1 0 0" range="-3.14 3.14"/>
+              <geom name="link4_geom" type="capsule" fromto="0 0 0 0.20 0 0" size="0.024" material="arm"/>
+              <body name="link5" pos="0.20 0 0">
+                <joint name="j5" type="hinge" axis="0 1 0" range="-2.2 2.2"/>
+                <geom name="link5_geom" type="capsule" fromto="0 0 0 0.16 0 0" size="0.022" material="arm"/>
+                <body name="link6" pos="0.16 0 0">
+                  <joint name="j6" type="hinge" axis="1 0 0" range="-3.14 3.14"/>
+                  <geom name="link6_geom" type="capsule" fromto="0 0 0 0.10 0 0" size="0.02" material="arm"/>
+                  <site name="ee_site" pos="0.12 0 0" type="sphere" size="0.025" rgba="0.05 0.2 0.95 1"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="m1" joint="j1" gear="45"/>
+    <motor name="m2" joint="j2" gear="45"/>
+    <motor name="m3" joint="j3" gear="38"/>
+    <motor name="m4" joint="j4" gear="25"/>
+    <motor name="m5" joint="j5" gear="22"/>
+    <motor name="m6" joint="j6" gear="16"/>
+  </actuator>
+</mujoco>
