@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-step-deg", type=float, default=5.0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--warmup-steps", type=int, default=5_000)
-    parser.add_argument("--replay-size", type=int, default=10_000)
+    parser.add_argument("--replay-size", type=int, default=100_000)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--exploration-noise", type=float, default=0.25)

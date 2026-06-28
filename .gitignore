@@ -1,7 +1,4 @@
-checkpoints_ddpg
-checkpoints_ppo
+
 .vscode
 .codex
 .agents
-logs_ddpg/
-logs_ppo/

@@ -42,9 +42,16 @@ class PandaObstacleEnv:
         goal_radius: float = 0.03,
         success_threshold: float = 0.05,
         reward_huber_delta: float = 0.1,
-        reward_obstacle_ref: float = 0.1,
+        reward_target_scale: float = 1.0,
+        reward_progress_scale: float = 30.0,
+        reward_obstacle_ref: float = 0.15,
         reward_obstacle_decay: float = 2.0,
         reward_time_ref: float = 0.2,
+        reward_energy_scale: float = 0.2,
+        reward_time_penalty: float = -0.01,
+        success_reward: float = 150.0,
+        collision_penalty: float = -200.0,
+        timeout_penalty: float = -20.0,
         collision_margin: float = 0.01,
         proximity_margin: float = 0.05,
         path_offset_range: float = 0.08,
@@ -71,9 +78,16 @@ class PandaObstacleEnv:
         self.goal_radius = float(goal_radius)
         self.success_threshold = float(success_threshold)
         self.reward_huber_delta = float(reward_huber_delta)
+        self.reward_target_scale = float(reward_target_scale)
+        self.reward_progress_scale = float(reward_progress_scale)
         self.reward_obstacle_ref = float(reward_obstacle_ref)
         self.reward_obstacle_decay = float(reward_obstacle_decay)
         self.reward_time_ref = float(reward_time_ref)
+        self.reward_energy_scale = float(reward_energy_scale)
+        self.reward_time_penalty = float(reward_time_penalty)
+        self.success_reward = float(success_reward)
+        self.collision_penalty = float(collision_penalty)
+        self.timeout_penalty = float(timeout_penalty)
         self.collision_margin = float(collision_margin)
         self.proximity_margin = float(proximity_margin)
         self.path_offset_range = float(path_offset_range)
@@ -117,7 +131,6 @@ class PandaObstacleEnv:
         ]
         if any(joint_id < 0 for joint_id in self.controlled_joint_ids):
             raise RuntimeError("Missing Panda joint ids for joint1 through joint6")
-        self.floor_height = float(self.model.geom_pos[self.floor_geom_id, 2]) if self.floor_geom_id >= 0 else 0.0
         self.platform_geom_ids = [
             geom_id
             for name in ("platform", "work_platform", "table", "workbench")
@@ -130,8 +143,8 @@ class PandaObstacleEnv:
             shape=(self.controlled_joints,),
             dtype=np.float32,
         )
-        # State: joint_pos(6), ee_pos(3), distance_to_goal(1), joint-obstacle distances(6).
-        obs_dim = self.controlled_joints + 3 + 1 + self.controlled_joints
+        # State: joint_pos(6), ee_pos(3), distance_to_goal(1), min joint-obstacle distance(1).
+        obs_dim = self.controlled_joints + 3 + 1 + 1
         self.observation_space = ContinuousBoxSpace(
             low=np.full(obs_dim, -np.inf, dtype=np.float32),
             high=np.full(obs_dim, np.inf, dtype=np.float32),
@@ -154,6 +167,7 @@ class PandaObstacleEnv:
         self.obstacles = np.zeros((self.num_obstacles, 3), dtype=np.float64)
         self.initial_ee_pos = np.zeros(3, dtype=np.float64)
         self.base_to_goal_distance = 1.0
+        self.prev_distance_to_goal = 0.0
         self.prev_action = np.zeros(self.action_dim, dtype=np.float64)
         self.step_count = 0
         self.viewer = None
@@ -185,6 +199,7 @@ class PandaObstacleEnv:
         self._sync_task_bodies()
         mujoco.mj_forward(self.model, self.data)
         self.base_to_goal_distance = max(float(np.linalg.norm(self._base_pos() - self.goal)), 1e-6)
+        self.prev_distance_to_goal = float(np.linalg.norm(self._ee_pos() - self.goal))
         self.data.ctrl[: self.controlled_joints] = self.data.qpos[: self.controlled_joints]
         self.data.ctrl[6] = self.home_joint_pos[6]
         if self.model.nu > self.arm_joints:
@@ -215,8 +230,15 @@ class PandaObstacleEnv:
         success = distance_to_goal < self.success_threshold and not collision
         timeout = self.step_count >= self.max_steps
         done = bool(success or collision or timeout)
+        if success:
+            reward += self.success_reward
+        if collision:
+            reward += self.collision_penalty
+        if timeout and not success:
+            reward += self.timeout_penalty
         obs = self._get_obs()
         self.prev_action = action.copy()
+        self.prev_distance_to_goal = distance_to_goal
         info = {
             "success": success,
             "is_success": success,
@@ -227,6 +249,7 @@ class PandaObstacleEnv:
             "min_obstacle_distance": min_obstacle_distance,
             "obstacle_clearance": min_obstacle_distance,
             "reward_target": reward_terms["target"],
+            "reward_progress": reward_terms["progress"],
             "reward_obstacle": reward_terms["obstacle"],
             "reward_energy": reward_terms["energy"],
             "reward_time": reward_terms["time"],
@@ -348,17 +371,17 @@ class PandaObstacleEnv:
                 rgba=rgba,
             )
 
-    # 网络输入包含前六个关节角、末端位置、末端到目标距离、各关节到静态障碍物的最小距离。
+    # 网络输入包含前六个关节角、末端位置、末端到目标距离、所有关节到静态障碍物距离的最小值。
     def _get_obs(self) -> np.ndarray:
         ee_pos = self._ee_pos()
         distance_to_goal = np.array([np.linalg.norm(ee_pos - self.goal)], dtype=np.float64)
-        min_joint_obstacle_distances = self._min_joint_static_obstacle_distances()
+        min_joint_obstacle_distance = np.array([np.min(self._min_joint_static_obstacle_distances())], dtype=np.float64)
         obs = np.concatenate(
             [
                 self.data.qpos[: self.controlled_joints],
                 ee_pos,
                 distance_to_goal,
-                min_joint_obstacle_distances,
+                min_joint_obstacle_distance,
             ]
         )
         if obs.shape != self.observation_space.shape:
@@ -375,32 +398,30 @@ class PandaObstacleEnv:
 
         distance_scale = self.base_to_goal_distance
         normalized_distance_to_goal = distance_to_goal / distance_scale
+        normalized_prev_distance_to_goal = self.prev_distance_to_goal / distance_scale
         normalized_min_obstacle_distance = min_obstacle_distance / distance_scale
         normalized_huber_delta = self.reward_huber_delta / distance_scale
         normalized_obstacle_ref = self.reward_obstacle_ref / distance_scale
-        normalized_time_ref = self.reward_time_ref / distance_scale
-    
+
         delta = normalized_huber_delta
         if normalized_distance_to_goal < delta:
-            reward_target = 0.5 * normalized_distance_to_goal**2
+            target_loss = 0.5 * normalized_distance_to_goal**2
         else:
-            reward_target = delta * (normalized_distance_to_goal - 0.5 * delta)
+            target_loss = delta * (normalized_distance_to_goal - 0.5 * delta)
 
-        reward_target = 1 / max(reward_target, 1e-6)
+        reward_target = -self.reward_target_scale * target_loss
+        reward_progress = self.reward_progress_scale * (normalized_prev_distance_to_goal - normalized_distance_to_goal)
 
         dref1 = normalized_obstacle_ref
         dobstacle = max(normalized_min_obstacle_distance, 1e-6)
         reward_obstacle = -((dref1 / (dobstacle + dref1)) ** self.reward_obstacle_decay)
 
-        reward_energy = -float(np.tanh(action_norm))
-        exp_action_norm = float(np.exp(np.clip(action_norm, -50.0, 50.0)))
-        if normalized_distance_to_goal < normalized_time_ref:
-            reward_time = float((1.0 / exp_action_norm) - 1.0)
-        else:
-            reward_time = float(1.0 / (1.0 + exp_action_norm))
+        reward_energy = -self.reward_energy_scale * float(np.tanh(action_norm))
+        reward_time = self.reward_time_penalty
 
         terms = {
             "target": reward_target,
+            "progress": reward_progress,
             "obstacle": reward_obstacle,
             "energy": reward_energy,
             "time": reward_time,
@@ -408,7 +429,6 @@ class PandaObstacleEnv:
             "normalized_min_obstacle_distance": normalized_min_obstacle_distance,
         }
         reward = sum(terms.values())
-        print(terms)
         return reward, distance_to_goal, min_obstacle_distance, collision_info, terms
 
     # 将归一化动作映射成受关节限位约束的位置目标。
@@ -430,9 +450,8 @@ class PandaObstacleEnv:
         joint_positions = self.data.xanchor[np.asarray(self.controlled_joint_ids, dtype=np.int32)]
         sphere_distances = np.linalg.norm(joint_positions[:, None, :] - self.obstacles[None, :, :], axis=2)
         sphere_clearances = np.maximum(sphere_distances - self.obstacle_radius, 0.0)
-        floor_clearances = np.maximum(joint_positions[:, 2] - self.floor_height, 0.0)
 
-        clearances = [np.min(sphere_clearances, axis=1), floor_clearances]
+        clearances = [np.min(sphere_clearances, axis=1)]
         for geom_id in self.platform_geom_ids:
             geom_pos = self.data.geom_xpos[geom_id]
             geom_radius = float(np.linalg.norm(self.model.geom_size[geom_id]))
