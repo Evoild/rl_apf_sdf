@@ -61,7 +61,7 @@ def main() -> None:
         raise ValueError(f"No metrics found in {args.log_file}")
 
     x_values = metrics["steps"]
-    figure, axes = plt.subplots(3, 2, figsize=(14, 10), constrained_layout=True)
+    figure, axes = plt.subplots(4, 2, figsize=(14, 13), constrained_layout=True)
     axes = axes.flatten()
 
     plot_group(axes[0], x_values, metrics, ["mean_return"], args.smooth)
@@ -90,9 +90,17 @@ def main() -> None:
     axes[4].set_title("PPO Diagnostics")
     axes[4].set_xlabel("steps")
 
-    plot_group(axes[5], x_values, metrics, ["target_distance", "min_obstacle_distance", "mean_episode_len"], args.smooth)
-    axes[5].set_title("Distances and Episode Length")
+    plot_group(axes[5], x_values, metrics, ["target_distance"], args.smooth)
+    axes[5].set_title("Target Distance")
     axes[5].set_xlabel("steps")
+
+    plot_group(axes[6], x_values, metrics, ["min_obstacle_distance"], args.smooth)
+    axes[6].set_title("Min Obstacle Distance")
+    axes[6].set_xlabel("steps")
+
+    plot_group(axes[7], x_values, metrics, ["mean_episode_len"], args.smooth)
+    axes[7].set_title("Mean Episode Length")
+    axes[7].set_xlabel("steps")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=160)
