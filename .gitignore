@@ -4,5 +4,5 @@
 .agents
 __pycache__/
 *.py[cod]
-logs_ddpg/
-logs_ppo/
+logs_ddpg
+logs_ppo
