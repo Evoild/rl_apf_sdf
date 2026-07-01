@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -40,27 +41,25 @@ class PandaObstacleEnv:
         num_obstacles: int = 1,
         obstacle_radius: float = 0.04,
         goal_radius: float = 0.03,
-        success_threshold: float = 0.05,
-        reward_huber_delta: float = 0.1,
-        reward_target_scale: float = 1.0,
-        reward_progress_scale: float = 30.0,
-        reward_obstacle_ref: float = 0.15,
-        reward_obstacle_decay: float = 2.0,
-        reward_time_ref: float = 0.2,
-        reward_energy_scale: float = 0.2,
-        reward_time_penalty: float = -0.01,
-        success_reward: float = 150.0,
-        collision_penalty: float = -200.0,
-        timeout_penalty: float = -20.0,
+        success_threshold: float = 0.01,
+        reward_target_scale: float = 0.1,
+        reward_obstacle_scale: float = 0.15,
+        reward_obstacle_ref: float = 0.1,
+        reward_time_penalty: float = -0.2,
+        risk_distance: float = 0.02,
+        distance_Delta: float = 0.2,
+        obstacle_ref: float = 0.15,
+        success_reward: float = 2000.0,
+        collision_penalty: float = -1000.0,
+        obstacle_obs_noise_std: float = 0.001,
         collision_margin: float = 0.01,
         proximity_margin: float = 0.05,
         path_offset_range: float = 0.08,
         min_safety_dist: float = 0.3,
         obstacle_disturb_prob: float = 0.0,
         obstacle_disturb_step: float = 0.02,
-        max_steps: int = 350,
+        max_steps: int = 300,
         frame_skip: int = 10,
-        max_joint_step: float = 0.12,
         seed: int | None = None,
         randomize_reset: bool = False,
     ) -> None:
@@ -77,17 +76,16 @@ class PandaObstacleEnv:
         self.obstacle_radius = float(obstacle_radius)
         self.goal_radius = float(goal_radius)
         self.success_threshold = float(success_threshold)
-        self.reward_huber_delta = float(reward_huber_delta)
         self.reward_target_scale = float(reward_target_scale)
-        self.reward_progress_scale = float(reward_progress_scale)
+        self.reward_obstacle_scale = float(reward_obstacle_scale)
         self.reward_obstacle_ref = float(reward_obstacle_ref)
-        self.reward_obstacle_decay = float(reward_obstacle_decay)
-        self.reward_time_ref = float(reward_time_ref)
-        self.reward_energy_scale = float(reward_energy_scale)
         self.reward_time_penalty = float(reward_time_penalty)
+        self.risk_distance = float(risk_distance)
+        self.distance_Delta = float(distance_Delta)
+        self.obstacle_ref = float(obstacle_ref)
         self.success_reward = float(success_reward)
         self.collision_penalty = float(collision_penalty)
-        self.timeout_penalty = float(timeout_penalty)
+        self.obstacle_obs_noise_std = float(obstacle_obs_noise_std)
         self.collision_margin = float(collision_margin)
         self.proximity_margin = float(proximity_margin)
         self.path_offset_range = float(path_offset_range)
@@ -96,13 +94,9 @@ class PandaObstacleEnv:
         self.obstacle_disturb_step = float(obstacle_disturb_step)
         self.max_steps = int(max_steps)
         self.frame_skip = int(frame_skip)
-        self.max_joint_step = float(max_joint_step)
         self.randomize_reset = bool(randomize_reset)
 
         self.ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "ee_center_site")
-        self.base_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "link0")
-        if self.base_body_id < 0:
-            raise RuntimeError("Missing Panda base body id for link0")
         self.target_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "target")
         self.obstacle_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
         self.obstacle_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle_geom")
@@ -143,8 +137,8 @@ class PandaObstacleEnv:
             shape=(self.controlled_joints,),
             dtype=np.float32,
         )
-        # State: joint_pos(6), ee_pos(3), distance_to_goal(1), min joint-obstacle distance(1).
-        obs_dim = self.controlled_joints + 3 + 1 + 1
+        # State: joint_pos(7), goal_position(3), noisy obstacle_position(3).
+        obs_dim = self.controlled_joints + 3 + 3
         self.observation_space = ContinuousBoxSpace(
             low=np.full(obs_dim, -np.inf, dtype=np.float32),
             high=np.full(obs_dim, np.inf, dtype=np.float32),
@@ -166,8 +160,7 @@ class PandaObstacleEnv:
         self.goal = np.zeros(3, dtype=np.float64)
         self.obstacles = np.zeros((self.num_obstacles, 3), dtype=np.float64)
         self.initial_ee_pos = np.zeros(3, dtype=np.float64)
-        self.base_to_goal_distance = 1.0
-        self.prev_distance_to_goal = 0.0
+        self.target_distance_scale = 1.0
         self.prev_action = np.zeros(self.action_dim, dtype=np.float64)
         self.step_count = 0
         self.viewer = None
@@ -198,8 +191,7 @@ class PandaObstacleEnv:
         self.prev_action.fill(0.0)
         self._sync_task_bodies()
         mujoco.mj_forward(self.model, self.data)
-        self.base_to_goal_distance = max(float(np.linalg.norm(self._base_pos() - self.goal)), 1e-6)
-        self.prev_distance_to_goal = float(np.linalg.norm(self._ee_pos() - self.goal))
+        self.target_distance_scale = max(float(np.linalg.norm(self.initial_ee_pos - self.goal)), 1e-6)
         self.data.ctrl[: self.controlled_joints] = self.data.qpos[: self.controlled_joints]
         self.data.ctrl[6] = self.home_joint_pos[6]
         if self.model.nu > self.arm_joints:
@@ -218,6 +210,24 @@ class PandaObstacleEnv:
         self.data.ctrl[6] = self.home_joint_pos[6]
         if self.model.nu > self.arm_joints:
             self.data.ctrl[self.arm_joints :] = 255.0
+        return self._advance_simulation(action)
+
+    # PPO 专用：将 6 维 [-1, 1] 动作直接映射到 joint1--joint6 的关节角目标。
+    def step_joint_position_action(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
+        action = np.asarray(action, dtype=np.float64)
+        if action.shape != self.action_space.shape:
+            raise ValueError(f"Expected action shape {self.action_space.shape}, got {action.shape}")
+
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        joint_ranges = self.model.jnt_range[: self.controlled_joints]
+        scaled_action = joint_ranges[:, 0] + (action + 1.0) * 0.5 * (joint_ranges[:, 1] - joint_ranges[:, 0])
+        self.data.ctrl[: self.controlled_joints] = scaled_action
+        self.data.ctrl[6] = self.home_joint_pos[6]
+        if self.model.nu > self.arm_joints:
+            self.data.ctrl[self.arm_joints :] = 255.0
+        return self._advance_simulation(action)
+
+    def _advance_simulation(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
 
@@ -230,15 +240,11 @@ class PandaObstacleEnv:
         success = distance_to_goal < self.success_threshold and not collision
         timeout = self.step_count >= self.max_steps
         done = bool(success or collision or timeout)
-        if success:
-            reward += self.success_reward
-        if collision:
-            reward += self.collision_penalty
-        if timeout and not success:
-            reward += self.timeout_penalty
+        reward_success = self.success_reward if success else 0.0
+        reward_collision = self.collision_penalty if collision else 0.0
+        reward += reward_success + reward_collision
         obs = self._get_obs()
         self.prev_action = action.copy()
-        self.prev_distance_to_goal = distance_to_goal
         info = {
             "success": success,
             "is_success": success,
@@ -249,13 +255,13 @@ class PandaObstacleEnv:
             "min_obstacle_distance": min_obstacle_distance,
             "obstacle_clearance": min_obstacle_distance,
             "reward_target": reward_terms["target"],
-            "reward_progress": reward_terms["progress"],
             "reward_obstacle": reward_terms["obstacle"],
-            "reward_energy": reward_terms["energy"],
+            "reward_success": reward_success,
+            "reward_collision": reward_collision,
             "reward_time": reward_terms["time"],
-            "normalized_distance_to_goal": reward_terms["normalized_distance_to_goal"],
+            "distance_to_goal": reward_terms["distance_to_goal"],
             "normalized_min_obstacle_distance": reward_terms["normalized_min_obstacle_distance"],
-            "base_to_goal_distance": self.base_to_goal_distance,
+            "target_distance_scale": self.target_distance_scale,
             "ground_collision": collision_info["ground_collision"],
             "self_collision": collision_info["self_collision"],
             "obstacle_collision": collision_info["obstacle_collision"],
@@ -371,70 +377,55 @@ class PandaObstacleEnv:
                 rgba=rgba,
             )
 
-    # 网络输入包含前六个关节角、末端位置、末端到目标距离、所有关节到静态障碍物距离的最小值。
+    # 网络输入包含七个机械臂关节角、目标位置和带观测噪声的第一个障碍物位置。
     def _get_obs(self) -> np.ndarray:
-        ee_pos = self._ee_pos()
-        distance_to_goal = np.array([np.linalg.norm(ee_pos - self.goal)], dtype=np.float64)
-        min_joint_obstacle_distance = np.array([np.min(self._min_joint_static_obstacle_distances())], dtype=np.float64)
+        obstacle_noise = self.rng.normal(0.0, self.obstacle_obs_noise_std, size=3)
+        noisy_obstacle_position = self.obstacles[0] + obstacle_noise
         obs = np.concatenate(
             [
                 self.data.qpos[: self.controlled_joints],
-                ee_pos,
-                distance_to_goal,
-                min_joint_obstacle_distance,
+                self.goal,
+                noisy_obstacle_position,
             ]
         )
+
         if obs.shape != self.observation_space.shape:
             raise RuntimeError(f"Observation shape drifted to {obs.shape}, expected {self.observation_space.shape}")
         return obs.astype(np.float32)
 
-    # 论文组合奖励：R = Rtarget + Robstacle + Renergy + Rtime。
+    # 组合奖励：R = Rtarget + Robstacle + Rtime，终止时额外加成功/碰撞奖励。
     def _reward(self, ee_pos: np.ndarray) -> tuple[float, float, float, dict[str, bool], dict[str, float]]:
         distance_to_goal = float(np.linalg.norm(ee_pos - self.goal))
         joint_obstacle_distances = self._min_joint_static_obstacle_distances()
         min_obstacle_distance = float(np.min(joint_obstacle_distances))
         collision_info = self._collision_info(ee_pos, min_obstacle_distance)
-        action_norm = float(np.linalg.norm(self.data.qvel[: self.controlled_joints]))
 
-        distance_scale = self.base_to_goal_distance
-        normalized_distance_to_goal = distance_to_goal / distance_scale
-        normalized_prev_distance_to_goal = self.prev_distance_to_goal / distance_scale
-        normalized_min_obstacle_distance = min_obstacle_distance / distance_scale
-        normalized_huber_delta = self.reward_huber_delta / distance_scale
-        normalized_obstacle_ref = self.reward_obstacle_ref / distance_scale
-
-        delta = normalized_huber_delta
-        if normalized_distance_to_goal < delta:
-            target_loss = 0.5 * normalized_distance_to_goal**2
+        if distance_to_goal < self.distance_Delta:
+            reward_target = 2 / (distance_to_goal+0.1)**2
         else:
-            target_loss = delta * (normalized_distance_to_goal - 0.5 * delta)
+            reward_target = 1 / (self.distance_Delta * (distance_to_goal - (self.distance_Delta - 0.1) / 2))
 
-        reward_target = -self.reward_target_scale * target_loss
-        reward_progress = self.reward_progress_scale * (normalized_prev_distance_to_goal - normalized_distance_to_goal)
-
-        dref1 = normalized_obstacle_ref
-        dobstacle = max(normalized_min_obstacle_distance, 1e-6)
-        reward_obstacle = -((dref1 / (dobstacle + dref1)) ** self.reward_obstacle_decay)
-
-        reward_energy = -self.reward_energy_scale * float(np.tanh(action_norm))
+        
+        reward_obstacle = -np.sqrt((self.reward_obstacle_ref / (min_obstacle_distance + self.reward_obstacle_ref)))
+        
         reward_time = self.reward_time_penalty
 
         terms = {
             "target": reward_target,
-            "progress": reward_progress,
             "obstacle": reward_obstacle,
-            "energy": reward_energy,
             "time": reward_time,
-            "normalized_distance_to_goal": normalized_distance_to_goal,
-            "normalized_min_obstacle_distance": normalized_min_obstacle_distance,
+            "distance_to_goal": distance_to_goal,
+            "normalized_min_obstacle_distance": min_obstacle_distance,
         }
-        reward = sum(terms.values())
+
+        reward = self.reward_target_scale * reward_target + self.reward_obstacle_scale * reward_obstacle + reward_time
+        
         return reward, distance_to_goal, min_obstacle_distance, collision_info, terms
 
     # 将归一化动作映射成受关节限位约束的位置目标。
     def _joint_action_to_target(self, action: np.ndarray) -> np.ndarray:
-        joint_delta = action * self.max_joint_step
-        joint_target = self.data.qpos[: self.controlled_joints] + joint_delta
+
+        joint_target = self.data.qpos[: self.controlled_joints] + action
         joint_low = self.model.jnt_range[: self.controlled_joints, 0]
         joint_high = self.model.jnt_range[: self.controlled_joints, 1]
         return np.clip(joint_target, joint_low, joint_high)
@@ -442,9 +433,6 @@ class PandaObstacleEnv:
     # 读取末端执行器 site 的世界坐标。
     def _ee_pos(self) -> np.ndarray:
         return self.data.site_xpos[self.ee_site_id].copy()
-
-    def _base_pos(self) -> np.ndarray:
-        return self.data.xpos[self.base_body_id].copy()
 
     def _min_joint_static_obstacle_distances(self) -> np.ndarray:
         joint_positions = self.data.xanchor[np.asarray(self.controlled_joint_ids, dtype=np.int32)]

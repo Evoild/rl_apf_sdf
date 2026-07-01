@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Categorical
+from torch.distributions import Normal
 
 
 @dataclass
@@ -15,27 +15,30 @@ class PPOConfig:
     clip_ratio: float = 0.2
     policy_lr: float = 3e-4
     value_lr: float = 1e-3
-    train_epochs: int = 10
-    minibatch_size: int = 128
-    entropy_coef: float = 0.01
+    train_epochs: int = 5
+    minibatch_size: int = 512
+    entropy_coef: float = 1e-4
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    hidden_size: int = 512
+    hidden_size: int = 256
+    log_std_init: float = -0.5
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int, log_std_init: float) -> None:
         super().__init__()
-        self.actor_logits = nn.Sequential(
+        self.actor_mean = nn.Sequential(
             nn.Linear(obs_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, action_dim),
+            nn.Tanh(),
         )
-        final_actor_layer = self.actor_logits[-1]
+        final_actor_layer = self.actor_mean[-2]
         nn.init.zeros_(final_actor_layer.weight)
         nn.init.zeros_(final_actor_layer.bias)
+        self.log_std = torch.nn.Parameter(torch.zeros(action_dim))
         self.critic = nn.Sequential(
             nn.Linear(obs_dim, hidden_size),
             nn.ReLU(),
@@ -44,31 +47,30 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden_size, 1),
         )
 
-    def action_probs(self, obs: torch.Tensor) -> torch.Tensor:
-        logits = self.actor_logits(obs)
- 
-        return torch.softmax(logits, dim=-1)
+    def action_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.actor_mean(obs)
 
-    def distribution(self, obs: torch.Tensor) -> Categorical:
-        return Categorical(probs=self.action_probs(obs))
+    def distribution(self, obs: torch.Tensor) -> Normal:
+        mean = self.action_mean(obs)
+        std = torch.exp(self.log_std).expand_as(mean)
+        return Normal(mean, std)
 
     def value(self, obs: torch.Tensor) -> torch.Tensor:
-
         return self.critic(obs).squeeze(-1)
 
 
 class RolloutBuffer:
     def __init__(self) -> None:
         self.observations: list[np.ndarray] = []
-        self.actions: list[int] = []
+        self.actions: list[np.ndarray] = []
         self.log_probs: list[float] = []
         self.rewards: list[float] = []
         self.dones: list[bool] = []
         self.values: list[float] = []
 
-    def add(self, obs, action: int, log_prob, reward, done, value) -> None:
+    def add(self, obs, action: np.ndarray, log_prob, reward, done, value) -> None:
         self.observations.append(obs)
-        self.actions.append(int(action))
+        self.actions.append(np.asarray(action, dtype=np.float32))
         self.log_probs.append(log_prob)
         self.rewards.append(reward)
         self.dones.append(done)
@@ -91,23 +93,25 @@ class PPOAgent:
     ) -> None:
         self.config = config
         self.device = torch.device(device)
-        self.model = ActorCritic(obs_dim, action_dim, config.hidden_size).to(self.device)
+        self.model = ActorCritic(obs_dim, action_dim, config.hidden_size, config.log_std_init).to(self.device)
         self.optimizer = torch.optim.Adam(
             [
-                {"params": self.model.actor_logits.parameters(), "lr": config.policy_lr},
+                {"params": self.model.actor_mean.parameters(), "lr": config.policy_lr},
+                {"params": [self.model.log_std], "lr": config.policy_lr},
                 {"params": self.model.critic.parameters(), "lr": config.value_lr},
             ]
         )
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray, deterministic: bool = False) -> tuple[int, float, float]:
+    def act(self, obs: np.ndarray, deterministic: bool = False) -> tuple[np.ndarray, float, float]:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         dist = self.model.distribution(obs_tensor)
-        action = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
-        log_prob = dist.log_prob(action)
+        raw_action = dist.mean if deterministic else dist.sample()
+        action = torch.clamp(raw_action, -1.0, 1.0)
+        log_prob = dist.log_prob(action).sum(dim=-1)
         value = self.model.value(obs_tensor)
         return (
-            int(action.item()),
+            action.squeeze(0).cpu().numpy().astype(np.float32),
             float(log_prob.item()),
             float(value.item()),
         )
@@ -129,10 +133,10 @@ class PPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         obs_np = np.nan_to_num(np.asarray(buffer.observations), nan=0.0, posinf=1e3, neginf=-1e3)
-        actions_np = np.asarray(buffer.actions, dtype=np.int64)
+        actions_np = np.clip(np.nan_to_num(np.asarray(buffer.actions), nan=0.0), -1.0, 1.0).astype(np.float32)
         log_probs_np = np.nan_to_num(np.asarray(buffer.log_probs), nan=0.0, posinf=0.0, neginf=0.0)
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(actions_np, dtype=torch.long, device=self.device)
+        actions = torch.as_tensor(actions_np, dtype=torch.float32, device=self.device)
         old_log_probs = torch.as_tensor(log_probs_np, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
@@ -145,7 +149,7 @@ class PPOAgent:
             for start in range(0, len(indices), cfg.minibatch_size):
                 batch = indices[start : start + cfg.minibatch_size]
                 dist = self.model.distribution(obs[batch])
-                log_probs = dist.log_prob(actions[batch])
+                log_probs = dist.log_prob(actions[batch]).sum(dim=-1)
                 log_ratio = log_probs - old_log_probs[batch]
                 ratio = torch.exp(log_ratio)
                 unclipped = ratio * advantages_t[batch]
@@ -154,7 +158,7 @@ class PPOAgent:
 
                 values_pred = self.model.value(obs[batch])
                 value_loss = nn.functional.mse_loss(values_pred, returns_t[batch])
-                entropy = dist.entropy().mean()
+                entropy = dist.entropy().sum(dim=-1).mean()
                 loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
                 if not torch.isfinite(loss):
                     continue

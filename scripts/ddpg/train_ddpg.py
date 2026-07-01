@@ -190,6 +190,7 @@ def main() -> None:
     episode_return = 0.0
     episode_len = 0
     completed_episodes = 0
+    best_success_rate = -float("inf")
     best_return = -float("inf")
     last_info = {
         "success": False,
@@ -285,7 +286,11 @@ def main() -> None:
                         noise=f"{agent.noise_std:.3f}",
                     )
 
-                if window_returns and mean_return > best_return:
+                if window_returns and (
+                    mean_success > best_success_rate
+                    or (mean_success == best_success_rate and mean_return > best_return)
+                ):
+                    best_success_rate = mean_success
                     best_return = mean_return
                     agent.save(str(args.checkpoint_dir / "best.pt"))
 

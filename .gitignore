@@ -2,3 +2,7 @@
 .vscode
 .codex
 .agents
+__pycache__/
+*.py[cod]
+logs_ddpg/
+logs_ppo/

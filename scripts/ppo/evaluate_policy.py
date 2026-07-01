@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from algorithms import PPOAgent, PPOConfig
 from envs import PandaObstacleEnv
-from discrete_actions import DISCRETE_ACTION_DIM, JOINT_STEP_DEG, discrete_action_to_env, make_joint_direction_actions
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,21 +19,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--joint-step-deg", type=float, default=JOINT_STEP_DEG)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    env = PandaObstacleEnv(randomize_reset=False, max_joint_step=np.deg2rad(args.joint_step_deg))
+    env = PandaObstacleEnv(randomize_reset=False)
     agent = PPOAgent(
         env.obs_dim,
-        DISCRETE_ACTION_DIM,
+        env.action_dim,
         PPOConfig(),
         device=args.device,
     )
     agent.load(str(args.checkpoint))
-    action_table = make_joint_direction_actions(env.action_dim)
 
     returns = []
     successes = []
@@ -45,8 +42,8 @@ def main() -> None:
         episode_return = 0.0
         step = 0
         while not done:
-            action_index, _, _ = agent.act(obs, deterministic=True)
-            obs, reward, done, info = env.step(discrete_action_to_env(action_index, action_table))
+            action, _, _ = agent.act(obs, deterministic=True)
+            obs, reward, done, info = env.step_joint_position_action(action)
             episode_return += reward
             collisions.append(float(info["collision"]))
             step += 1
